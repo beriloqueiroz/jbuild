@@ -1,0 +1,71 @@
+#compdef jbuild
+
+_jbuild() {
+  local -a jobs branches actions params
+  local job branch line name choices desc choice
+
+  actions=(
+    'build:dispara o build e acompanha ao vivo'
+    'watch:acompanha o último build ao vivo'
+    'status:resultado do último build'
+    'stages:etapas do último build'
+    'log:console completo, ou de uma etapa'
+    'params:parâmetros da branch'
+  )
+
+  if (( CURRENT == 2 )); then
+    jobs=(${(f)"$(jbuild --complete jobs 2>/dev/null)"})
+    _describe -t jobs 'job' jobs
+    return
+  fi
+
+  job=${words[2]}
+  branches=(${(f)"$(jbuild --complete branches $job 2>/dev/null)"})
+
+  if (( CURRENT == 3 )); then
+    _describe -t branches 'branch' branches
+    _describe -t actions 'ação' actions
+    return
+  fi
+
+  if (( ${branches[(I)${words[3]}]} )); then
+    branch=${words[3]}
+  else
+    branch=${JBUILD_DEFAULT_BRANCH:-sandbox}
+  fi
+
+  params=()
+  for line in ${(f)"$(jbuild --complete params $job $branch 2>/dev/null)"}; do
+    name=${line%%:*}; line=${line#*:}
+    choices=${line%%:*}; desc=${line#*:}
+    if [[ -n $choices ]]; then
+      for choice in ${(s.|.)choices}; do
+        params+=("${name}=${choice}:${desc}")
+      done
+    else
+      params+=("${name}=:${desc}")
+    fi
+  done
+
+  local -a names
+  names=(build watch status stages log params)
+
+  local given word
+  for word in ${words[2,CURRENT-1]}; do
+    if (( ${names[(Ie)$word]} )); then
+      given=$word
+      break
+    fi
+  done
+
+  if [[ -n $given ]]; then
+    (( ${#params} )) && _describe -t params 'parâmetro' params
+    [[ $given == log ]] && _message 'etapa (vazio = console completo)'
+    return
+  fi
+
+  _describe -t actions 'ação' actions
+  (( ${#params} )) && _describe -t params 'parâmetro' params
+}
+
+_jbuild "$@"

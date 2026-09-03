@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""jbuild — dispara, acompanha e inspeciona builds multibranch do Jenkins."""
+
+import html
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from jenkins_api import Jenkins, die, load_config, load_jobs, resolve  # noqa: E402
+
+ACTIONS = ("build", "status", "log", "watch", "stages", "params")
+
+TTY = sys.stdout.isatty()
+C = {
+    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
+    "green": "\033[32m", "red": "\033[31m", "yellow": "\033[33m",
+    "blue": "\033[34m", "grey": "\033[90m",
+} if TTY else dict.fromkeys(
+    ("reset", "dim", "bold", "green", "red", "yellow", "blue", "grey"), ""
+)
+
+STATE_STYLE = {
+    "success": ("✓", "green"), "failure": ("✗", "red"), "failed": ("✗", "red"),
+    "unstable": ("!", "yellow"), "aborted": ("⊘", "grey"), "running": ("*", "yellow"),
+    "in_progress": ("*", "yellow"), "paused": ("⏸", "blue"), "queued": ("·", "grey"),
+    "not_built": ("○", "grey"), "skipped": ("○", "grey"), "unknown": ("○", "grey"),
+}
+
+
+def paint(text, color):
+    return f"{C.get(color, '')}{text}{C['reset']}" if C.get(color) else text
+
+
+def human_ms(ms):
+    if not ms:
+        return "—"
+    seconds = ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, seconds = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def ago(ts_ms):
+    if not ts_ms:
+        return "—"
+    delta = time.time() - ts_ms / 1000
+    if delta < 90:
+        return f"há {int(delta)}s"
+    if delta < 5400:
+        return f"há {int(delta // 60)}min"
+    if delta < 172800:
+        return f"há {int(delta // 3600)}h"
+    return time.strftime("%d/%m %H:%M", time.localtime(ts_ms / 1000))
+
+
+def usage(jobs, code=1):
+    print("uso: jbuild <job> [branch] [ação] [PARAM=valor ...]")
+    print(f"ações: {' | '.join(ACTIONS)}   (default: build)")
+    print("flags: -y (não confirma)  --no-watch  -n <linhas>  -b <número do build>")
+    if jobs:
+        print("\njobs:")
+        for alias in sorted(jobs):
+            print(f"  {alias:<22} {jobs[alias]['path']}")
+    sys.exit(code)
+
+
+def parse_args(argv, default_branch, jobs):
+    opts = {"yes": False, "watch": True, "lines": None, "build": None}
+    rest, params = [], {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-y", "--yes"):
+            opts["yes"] = True
+        elif arg == "--no-watch":
+            opts["watch"] = False
+        elif arg in ("-n", "--lines"):
+            i += 1
+            opts["lines"] = int(argv[i])
+        elif arg in ("-b", "--build"):
+            i += 1
+            opts["build"] = argv[i].lstrip("#")
+        elif arg in ("-h", "--help"):
+            usage(jobs, 0)
+        elif "=" in arg and not arg.startswith("-"):
+            key, _, value = arg.partition("=")
+            params[key] = value
+        else:
+            rest.append(arg)
+        i += 1
+
+    if not rest:
+        usage(jobs)
+    job = rest.pop(0)
+    branch, action, target = default_branch, "build", None
+    if rest and rest[0] in ACTIONS:
+        action = rest.pop(0)
+    elif rest:
+        branch = rest.pop(0)
+        if rest and rest[0] in ACTIONS:
+            action = rest.pop(0)
+    if rest:
+        target = rest.pop(0)
+    return job, branch, action, target, params, opts
+
+
+def stage_tree(jenkins, build_url):
+    try:
+        data = jenkins.get_json(f"{build_url}/pipeline-overview/tree")
+    except urllib.error.HTTPError:
+        return None
+    except Exception:
+        return None
+    return data.get("data") if data.get("status") == "ok" else None
+
+
+def build_info(jenkins, build_url):
+    tree = "number,building,result,timestamp,duration,displayName,url,actions[parameters[name,value]]"
+    return jenkins.get_json(f"{build_url}/api/json?tree={tree}")
+
+
+def render_stages(info, tree, header):
+    lines = [header, ""]
+    if info:
+        state = "running" if info.get("building") else (info.get("result") or "unknown")
+        symbol, color = STATE_STYLE.get(str(state).lower(), ("○", "grey"))
+        name = info.get("displayName") or f"#{info.get('number')}"
+        lines.append(
+            f"{paint(symbol, color)} {C['bold']}{name}{C['reset']} "
+            f"{paint(str(state).lower(), color)}  {C['dim']}{ago(info.get('timestamp'))}"
+            f" · {human_ms(info.get('duration'))}{C['reset']}"
+        )
+        params = [
+            p for action in info.get("actions", [])
+            for p in (action.get("parameters") or [])
+        ]
+        if params:
+            joined = "  ".join(f"{p['name']}={p.get('value')}" for p in params)
+            lines.append(f"  {C['dim']}{joined}{C['reset']}")
+        lines.append("")
+
+    if tree is None:
+        lines.append(f"{C['dim']}(sem detalhe de etapas — plugin pipeline-graph-view ausente){C['reset']}")
+        return lines
+
+    lines.append("ETAPAS")
+    for stage in tree.get("stages", []):
+        symbol, color = STATE_STYLE.get(str(stage["state"]).lower(), ("○", "grey"))
+        duration = human_ms(stage.get("totalDurationMillis"))
+        lines.append(
+            f"  {paint(symbol, color)} {stage['name']:<26} "
+            f"{C['dim']}{duration:>8}{C['reset']}"
+        )
+    return lines
+
+
+def watch(jenkins, build_url, poll, header):
+    try:
+        while True:
+            info = build_info(jenkins, build_url)
+            tree = stage_tree(jenkins, build_url)
+            done = not info.get("building")
+            if TTY:
+                sys.stdout.write("\033[H\033[2J")
+            top = header
+            if not done:
+                top += f"\n{C['dim']}atualizando a cada {poll}s — Ctrl+C para sair{C['reset']}"
+            print("\n".join(render_stages(info, tree, top)))
+            if done:
+                return info, tree
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("\n(saindo do acompanhamento; o build segue no Jenkins)")
+        sys.exit(0)
+
+
+def find_stage(tree, target):
+    if not tree:
+        return None
+    stages = tree.get("stages", [])
+    for stage in stages:
+        if stage["id"] == target or stage["name"].lower() == target.lower():
+            return stage
+    for stage in stages:
+        if target.lower() in stage["name"].lower():
+            return stage
+    return None
+
+
+def strip_html(text):
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def stage_log(jenkins, build_url, stage):
+    chunks = []
+    try:
+        steps = jenkins.get_json(
+            f"{build_url}/pipeline-overview/steps?nodeId={stage['id']}"
+        )["data"]["steps"]
+    except Exception:
+        return ""
+    for step in steps:
+        try:
+            data = jenkins.get_json(
+                f"{build_url}/pipeline-overview/consoleOutput?nodeId={step['id']}"
+            )["data"]
+        except Exception:
+            continue
+        text = strip_html(data.get("text") or "")
+        if text.strip():
+            chunks.append(text if text.endswith("\n") else text + "\n")
+    return "".join(chunks)
+
+
+def failed_stage(tree):
+    if not tree:
+        return None
+    for stage in tree.get("stages", []):
+        if str(stage["state"]).lower() in ("failed", "failure", "unstable"):
+            return stage
+    return None
+
+
+def wait_queue(jenkins, location, poll):
+    print(f"{C['dim']}na fila...{C['reset']}")
+    while True:
+        data = jenkins.get_json(f"{location.rstrip('/')}/api/json")
+        if data.get("cancelled"):
+            die("build cancelado na fila")
+        executable = data.get("executable")
+        if executable:
+            return executable["number"], executable["url"].rstrip("/")
+        why = data.get("why")
+        if why:
+            print(f"\r{C['dim']}{why}{C['reset']}\033[K", end="", flush=True)
+        time.sleep(poll)
+
+
+def do_build(jenkins, job, branch, params, defined, opts, cfg, header):
+    values = {}
+    for param in defined:
+        default = param.get("default")
+        if default is not None:
+            values[param["name"]] = str(default)
+    known = {p["name"]: p for p in defined}
+    for key, value in params.items():
+        if key not in known:
+            allowed = ", ".join(known) or "nenhum"
+            die(f"parâmetro '{key}' não existe em {job['path']}/{branch} (disponíveis: {allowed})")
+        choices = known[key].get("choices") or []
+        if choices and value not in choices:
+            die(f"valor inválido para {key}: '{value}' (opções: {', '.join(choices)})")
+        values[key] = value
+
+    base = jenkins.job_url(job["path"], branch)
+    print(f"{header}")
+    if values:
+        for name in sorted(values):
+            marker = "" if name in params else f" {C['dim']}(default){C['reset']}"
+            print(f"  {name} = {C['bold']}{values[name]}{C['reset']}{marker}")
+
+    if not opts["yes"]:
+        try:
+            answer = input(f"disparar build de {job['path']}/{branch}? [s/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("s", "y", "sim", "yes"):
+            print("abortado.")
+            return 0
+
+    if values:
+        query = urllib.parse.urlencode(values)
+        status, location = jenkins.post(f"{base}/buildWithParameters?{query}")
+    else:
+        status, location = jenkins.post(f"{base}/build")
+    if status not in (200, 201):
+        die(f"falhou ao disparar (HTTP {status})")
+    print(f"{paint('disparado', 'green')}: {base}")
+
+    if not opts["watch"] or not location:
+        return 0
+    poll = int(cfg["JBUILD_POLL_SECONDS"])
+    number, build_url = wait_queue(jenkins, location, poll)
+    info, tree = watch(jenkins, build_url, poll, f"{job['path']} · {branch} #{number}")
+    return report(jenkins, build_url, info, tree)
+
+
+def report(jenkins, build_url, info, tree):
+    result = str(info.get("result") or "").lower()
+    if result == "success":
+        print(f"\n{paint('build concluído com sucesso', 'green')}")
+        return 0
+    stage = failed_stage(tree)
+    print(f"\n{paint('build ' + (result or 'sem resultado'), 'red')}")
+    if stage:
+        print(f"{C['bold']}log da etapa que falhou: {stage['name']}{C['reset']}\n")
+        text = stage_log(jenkins, build_url, stage)
+        print(text.rstrip() if text.strip() else "(etapa sem saída de console)")
+    else:
+        print(f"{C['dim']}use: jbuild <job> <branch> log{C['reset']}")
+    return 1
+
+
+def complete(cfg, argv):
+    try:
+        jobs = load_jobs(cfg["JBUILD_JOBS_FILE"])
+    except SystemExit:
+        return 0
+    what = argv[0] if argv else "jobs"
+    if what == "jobs":
+        for alias in sorted(jobs):
+            print(f"{alias}:{jobs[alias]['path']}")
+    elif what == "branches" and len(argv) > 1:
+        job = jobs.get(argv[1])
+        for branch in sorted((job or {}).get("branches", {})):
+            print(branch)
+    elif what == "params" and len(argv) > 2:
+        job = jobs.get(argv[1]) or {}
+        meta = job.get("branches", {}).get(argv[2], {})
+        for param in meta.get("params", []):
+            choices = "|".join(param.get("choices") or [])
+            print(f"{param['name']}:{choices}:{param.get('description', '')}")
+    return 0
+
+
+def main():
+    cfg = load_config()
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--complete":
+        return complete(cfg, argv[1:])
+
+    jobs = load_jobs(cfg["JBUILD_JOBS_FILE"])
+    job_name, branch, action, target, params, opts = parse_args(
+        argv, cfg["JBUILD_DEFAULT_BRANCH"], jobs
+    )
+    job = resolve(jobs, job_name)
+    jenkins = Jenkins(cfg["JENKINS_URL"])
+    poll = int(cfg["JBUILD_POLL_SECONDS"])
+
+    branches = job.get("branches", {})
+    if branches and branch not in branches:
+        die(f"branch '{branch}' não existe em {job['path']} (tem: {', '.join(sorted(branches))})")
+    defined = branches.get(branch, {}).get("params", [])
+    header = f"{C['bold']}{job['path']}{C['reset']} · {branch}"
+
+    if action == "params":
+        if not defined:
+            print(f"{header}: sem parâmetros")
+            return 0
+        print(header)
+        for param in defined:
+            choices = param.get("choices") or []
+            print(f"  {C['bold']}{param['name']}{C['reset']}"
+                  f"  {C['dim']}{param.get('type', '')}{C['reset']}")
+            if param.get("description"):
+                print(f"    {param['description']}")
+            if choices:
+                print(f"    opções: {', '.join(choices)}")
+            if param.get("default") is not None:
+                print(f"    default: {param['default']}")
+        return 0
+
+    if action == "build":
+        return do_build(jenkins, job, branch, params, defined, opts, cfg, header)
+
+    base = jenkins.job_url(job["path"], branch)
+    build_url = f"{base}/{opts['build'] or 'lastBuild'}"
+    try:
+        jenkins.get_json(f"{build_url}/api/json?tree=number")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            which = f"build #{opts['build']}" if opts["build"] else "nenhum build"
+            die(f"{which} em {job['path']}/{branch} — o job existe mas não tem esse build")
+        raise
+
+    if action == "status":
+        info = build_info(jenkins, build_url)
+        state = "RODANDO" if info.get("building") else (info.get("result") or "?")
+        stamp = time.strftime("%d/%m %H:%M", time.localtime(info["timestamp"] / 1000))
+        print(f"{info.get('displayName')}  {state}  ({stamp})")
+        return 0
+
+    if action == "watch":
+        info, tree = watch(jenkins, build_url, poll, header)
+        return report(jenkins, build_url, info, tree)
+
+    if action == "stages":
+        info = build_info(jenkins, build_url)
+        print("\n".join(render_stages(info, stage_tree(jenkins, build_url), header)))
+        return 0
+
+    if action == "log":
+        if target:
+            tree = stage_tree(jenkins, build_url)
+            stage = find_stage(tree, target)
+            if not stage:
+                names = ", ".join(s["name"] for s in (tree or {}).get("stages", []))
+                die(f"etapa '{target}' não encontrada (tem: {names})")
+            text = stage_log(jenkins, build_url, stage)
+            print(text.rstrip() if text.strip() else "(etapa sem saída de console)")
+            return 0
+        lines = int(opts["lines"] or cfg["JBUILD_LOG_LINES"])
+        text = jenkins.get_text(f"{build_url}/consoleText")
+        print("\n".join(text.splitlines()[-lines:]))
+        return 0
+
+    usage(jobs)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except urllib.error.HTTPError as exc:
+        die(f"HTTP {exc.code} em {exc.url}")
+    except urllib.error.URLError as exc:
+        die(f"falha de rede: {exc.reason}")

@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Reescreve o cache de jobs com caminho, branches e parâmetros de cada job
+multibranch do Jenkins. Config em ~/.jbuildrc."""
+
+import json
+import os
+import sys
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from jenkins_api import Jenkins, load_config  # noqa: E402
+
+MULTIBRANCH = "workflow.multibranch.WorkflowMultiBranchProject"
+PARAM_TREE = (
+    "jobs[name,property[parameterDefinitions"
+    "[name,type,description,defaultParameterValue[value],choices]]]"
+)
+
+
+def discover(jenkins):
+    tree = "jobs[name,_class,jobs[name,_class,jobs[name,_class,jobs[name,_class]]]]"
+    data = jenkins.get_json(f"{jenkins.base}/api/json?tree={tree}")
+    found = []
+
+    def walk(jobs, prefix=""):
+        for job in jobs:
+            path = f"{prefix}/{job['name']}" if prefix else job["name"]
+            if MULTIBRANCH in job.get("_class", ""):
+                found.append(path)
+            elif job.get("jobs"):
+                walk(job["jobs"], path)
+
+    walk(data.get("jobs", []))
+    return found
+
+
+def alias_for(path, strip, taken):
+    name = path.rsplit("/", 1)[-1].lower()
+    for prefix in strip:
+        name = name.removeprefix(prefix.lower())
+    if not name or name in taken:
+        name = path.lower().replace("/", "-")
+    return name
+
+
+def params_of(branch):
+    out = []
+    for prop in branch.get("property") or []:
+        for param in prop.get("parameterDefinitions") or []:
+            default = (param.get("defaultParameterValue") or {}).get("value")
+            out.append({
+                "name": param["name"],
+                "type": param.get("type", ""),
+                "description": (param.get("description") or "").strip(),
+                "default": default,
+                "choices": param.get("choices") or [],
+            })
+    return out
+
+
+def fetch_branches(jenkins, path):
+    url = f"{jenkins.job_url(path)}/api/json?tree={PARAM_TREE}"
+    try:
+        data = jenkins.get_json(url)
+    except Exception as exc:
+        print(f"  aviso: {path}: {exc}", file=sys.stderr)
+        return path, {}
+    return path, {
+        urllib.parse.unquote(b["name"]): {"params": params_of(b)}
+        for b in data.get("jobs", [])
+    }
+
+
+def main():
+    cfg = load_config()
+    jenkins = Jenkins(cfg["JENKINS_URL"])
+    strip = [p for p in cfg["JBUILD_STRIP_PREFIXES"].split(",") if p]
+
+    paths = discover(jenkins)
+    if not paths:
+        print("nenhum job multibranch encontrado", file=sys.stderr)
+        return 1
+    print(f"{len(paths)} jobs — lendo branches e parâmetros...")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        branches = dict(pool.map(lambda p: fetch_branches(jenkins, p), paths))
+
+    jobs, taken = {}, set()
+    for path in sorted(paths):
+        alias = alias_for(path, strip, taken)
+        taken.add(alias)
+        jobs[alias] = {"path": path, "branches": branches.get(path, {})}
+
+    out = {
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "jenkins": jenkins.base,
+        "jobs": jobs,
+    }
+    target = cfg["JBUILD_JOBS_FILE"]
+    tmp = f"{target}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(out, fh, indent=1, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, target)
+
+    print(f"{target} atualizado — {len(jobs)} jobs:")
+    for alias in sorted(jobs):
+        job = jobs[alias]
+        branches = job["branches"]
+        params = sorted({
+            p["name"] for meta in branches.values() for p in meta["params"]
+        })
+        note = f"  {len(branches)} branches"
+        if params:
+            note += f", params: {', '.join(params)}"
+        print(f"  {alias:<30} {job['path']}{note}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
