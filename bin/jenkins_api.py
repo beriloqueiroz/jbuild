@@ -29,14 +29,18 @@ def load_config():
     cfg = dict(DEFAULTS)
     rc = os.environ.get("JBUILD_CONFIG", os.path.expanduser("~/.jbuildrc"))
     if os.path.isfile(rc):
+        keys = " ".join(DEFAULTS)
+        script = (
+            f'. "{rc}" || exit 1\n'
+            f'for k in {keys}; do printf "%s=%s\\0" "$k" "${{!k}}"; done'
+        )
         dump = subprocess.run(
-            ["bash", "-c", f'set -a; source "{rc}"; env -0'],
-            capture_output=True, text=True,
+            ["bash", "-c", script], capture_output=True, text=True,
         )
         if dump.returncode == 0:
             for entry in dump.stdout.split("\0"):
                 key, sep, value = entry.partition("=")
-                if sep and key in DEFAULTS:
+                if sep and value and key in DEFAULTS:
                     cfg[key] = value
     for key in DEFAULTS:
         if os.environ.get(key):

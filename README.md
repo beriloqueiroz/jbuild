@@ -31,8 +31,13 @@ Flags: `-y` (não pede confirmação), `--no-watch`, `-n <linhas>`,
 
 ## Requisitos
 
-`python3` (só stdlib) e, para o completion, zsh. Sem `curl`, sem
-`jenkins-cli.jar`, sem Java — tudo via API REST.
+`python3` (só a stdlib) e `bash`, usado apenas para ler o `~/.jbuildrc`. Zsh só
+para o completion. Sem `curl`, sem `jenkins-cli.jar`, sem Java — tudo via API
+REST.
+
+Roda em Linux e macOS. No macOS o `python3` não vem pronto: instale com
+`xcode-select --install` ou `brew install python`. O `bash` 3.2 que a Apple
+distribui é suficiente.
 
 O detalhe por etapa depende do plugin **pipeline-graph-view** no Jenkins. Sem
 ele, `build`/`status`/`log` seguem funcionando e `watch`/`stages` avisam que não
