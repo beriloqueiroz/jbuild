@@ -59,8 +59,22 @@ linha a acrescentar. O completion só passa a valer num shell novo.
 Depois:
 
 1. Edite `~/.jbuildrc` com a URL do seu Jenkins.
-2. Gere um API token no Jenkins (avatar → *Security* → *API Token*) e registre
-   no `~/.netrc` (`chmod 600`):
+2. Gere um API token no Jenkins:
+
+   1. Logado no Jenkins, clique no seu nome no canto superior direito — ou vá
+      direto em `https://jenkins.exemplo.com/me`.
+   2. No menu da esquerda, clique em **Security**.
+   3. Na seção **API Token**, clique em **Add new Token**.
+   4. Dê um nome (`jbuild`, por exemplo) e clique em **Generate**.
+   5. **Copie o token agora** — o Jenkins mostra uma única vez e depois só
+      permite revogar.
+   6. Repare no seu *user id* na URL da página (`/user/<id>/security`): é ele
+      que vai no `~/.netrc`, e nem sempre é o seu e-mail.
+
+   Em Jenkins mais antigos o token mora na página *Configure* do usuário, não em
+   *Security* — se não achar **Security** no menu, procure lá.
+
+3. Registre no `~/.netrc` e proteja o arquivo:
 
    ```
    machine jenkins.exemplo.com
@@ -68,10 +82,14 @@ Depois:
      password seu-token
    ```
 
-   Atenção: o *user id* do Jenkins nem sempre é o e-mail — confira na URL do seu
-   perfil (`/user/<id>/`).
+   ```bash
+   chmod 600 ~/.netrc
+   ```
 
-3. `jenkins-jobs-update` e pronto.
+   O `machine` é só o host, sem `https://` e sem barra no fim. O Python lê esse
+   arquivo sozinho — o jbuild nunca guarda a credencial.
+
+4. Rode `jenkins-jobs-update` e pronto.
 
 ## Uso
 
