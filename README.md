@@ -50,6 +50,12 @@ git clone https://github.com/beriloqueiroz/jbuild && cd jbuild
 ./install.sh
 ```
 
+Os binários vão para o primeiro destino gravável entre `/opt/homebrew/bin`,
+`/usr/local/bin` e `~/.local/bin`; o completion, para `site-functions` ou
+`~/.zsh/completions`. Se o destino não estiver no `PATH` — o que costuma
+acontecer no macOS, onde sobra o `~/.local/bin` —, o instalador avisa e mostra a
+linha a acrescentar. O completion só passa a valer num shell novo.
+
 Depois:
 
 1. Edite `~/.jbuildrc` com a URL do seu Jenkins.
